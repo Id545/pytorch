@@ -39,12 +39,14 @@ forward outputs' own metadata.
 
 ``guard_filter_fn`` rides on the optimize context rather than on the
 serializer, so the guards it drops leave the live check too and a capture
-recompiles less often than ordinary ``torch.compile`` would.
+recompiles less often than ordinary ``torch.compile`` would, and every dropped
+guard is reported in ``PrecompileSummary.dropped_guards``.
 
 A resume function only exists once the frame ahead of it has actually run, so
 every variant must be exercised. Whatever you do not run is not in the
-artifact: it covers what was observed, not every possible input to the
-callable.
+artifact, and ``summary().complete`` means complete only for the observed
+capture, not for every possible input to the callable. A captured call that
+raises marks the session incomplete even if caller code catches it.
 
 Know these before relying on an artifact in production:
 
@@ -57,11 +59,15 @@ Know these before relying on an artifact in production:
   by equality, so an int/bool/str argument or a break coming from ``.item()``
   yields an artifact that only serves calls reproducing those exact values.
   Exercise every value you need to serve with a ``cap(...)`` call, or expect
-  poor coverage on new data. ``dynamic=True`` helps with shapes but not with
-  pinned values.
+  poor coverage on new data.
+  ``dynamic=True`` helps with shapes but not with pinned values.
 * Identity guards cannot be serialized, so precompiling gives up on noticing
-  that a guarded object was rebound. Every model drops them, so a capture that
-  refused every drop would refuse essentially every real artifact.
+  that a guarded object was rebound. ``summary().dropped_guards`` is the
+  authoritative list, and ``risky_dropped_guards`` narrows it to the drops
+  observed to distinguish the captured variants plus the ones a custom filter
+  added; it is still not a proof for unobserved deployments. Every model drops
+  identity guards, so a policy that refused every drop would refuse essentially
+  every real artifact.
 * Some models do not capture yet. For example, T5 raises ``PackageError: Cannot
   find module for code <code object __init__`` from ``_get_code_source``, which
   is byte-identical to base and which plain ``caching_precompile`` also raises.
@@ -88,7 +94,7 @@ from typing import Any, TYPE_CHECKING
 import torch
 import torch._functorch.config as functorch_config
 from torch._guards import ChainedSource
-from torch.compiler._precompile_types import PrecompileSummary
+from torch.compiler._precompile_types import GuardFact as _GuardFact, PrecompileSummary
 from torch.utils._config_module import ConfigModule
 
 from .aot_compile import _BUILTINS_DICT_PREFIX, _IMPORT_ALIAS_PREFIX
@@ -112,7 +118,6 @@ if TYPE_CHECKING:
     from typing import NoReturn
 
     from torch._guards import Source
-    from torch.compiler._precompile_types import GuardFact as _GuardFact
 
     from .convert_frame import ConvertFrameReturn
     from .eval_frame import OptimizeContext
@@ -1736,8 +1741,8 @@ def _summarize(
 
 
 def _compose_with_default(
-    user: Callable[[Sequence[GuardFilterEntry]], Sequence[bool]],
-) -> Callable[[Sequence[GuardFilterEntry]], Sequence[bool]]:
+    user: Callable[[Sequence[GuardFilterEntry]], Sequence[bool]] | None,
+) -> Callable[[Sequence[GuardFilterEntry]], tuple[Sequence[bool], Sequence[bool]]]:
     """AND a caller's filter with the default rather than replacing it.
 
     ``default_guard_filter_fn`` is not a default in the "sensible starting point"
@@ -1746,20 +1751,41 @@ def _compose_with_default(
     silently re-admits every unserializable one, and the failure surfaces as
     "ID_MATCH guard cannot be serialized" in frames that have nothing to do with
     their filter. A custom filter can only ever want to drop MORE, so composing
-    is the only reading that makes sense.
+    is the only reading that makes sense. ``user=None`` is no custom filter at
+    all, where the default's decisions ARE the composition.
+
+    Both are returned: the recorder judges a drop against the default's own
+    verdict, and returning it here is what keeps the default to one call per
+    compile.
     """
 
-    def composed(entries: Sequence[GuardFilterEntry]) -> Sequence[bool]:
+    def composed(
+        entries: Sequence[GuardFilterEntry],
+    ) -> tuple[Sequence[bool], Sequence[bool]]:
         base = default_guard_filter_fn(entries)
+        if user is None:
+            return base, base
         chosen = user(entries)
         if len(chosen) != len(entries):
             raise ValueError(
                 f"guard_filter_fn returned {len(chosen)} decisions for "
                 f"{len(entries)} guards; it must return one per entry."
             )
-        return [bool(a) and bool(b) for a, b in zip(base, chosen)]
+        return [bool(a) and bool(b) for a, b in zip(base, chosen)], base
 
     return composed
+
+
+# A compiled frame, as _varying_guard_slots and _wont_generalize key it: what
+# the report prints for it. Two frames whose code objects share a name, a file
+# and a first line -- two lambdas on one line, or two frames exec'd under
+# "<string>" -- read as variants of one frame, which is the tradeoff those
+# helpers take.
+_FrameKey = tuple[str, str, int]
+
+# What one variant checked for a slot: the rendered check and the value it
+# compared, which is what changes when the value behind a dropped slot changes.
+_SlotCheck = tuple[tuple[str, ...], str]
 
 
 def _entry_fn_of(fn: object) -> Callable[..., object]:
@@ -1959,12 +1985,20 @@ class PrecompileSession:
         # eagerly, so the artifact carries AOTAutograd's CompiledFunction and
         # calling .backward() on a served output runs precompiled code.
         self._training = training
+        # slot -> the check it rendered as, for every slot dropped by any
+        # route. See PrecompileSummary.dropped_guard_code for why the slot
+        # tuple alone cannot be audited.
+        self._dropped_guard_code: dict[tuple[str, str], str] = {}
+        self._dropped_guards: set[tuple[str, str]] = set()
+        self._kept_guards: set[tuple[str, str]] = set()
+        self._risky_dropped_guards: set[tuple[str, str]] = set()
         self._capture_errors: list[str] = []
         self._recorded_exception_keys: set[tuple[type[BaseException], str]] = set()
-        self._guard_filter_fn = (
-            default_guard_filter_fn
-            if guard_filter_fn is None
-            else _compose_with_default(guard_filter_fn)
+        # frame -> one fact set per compilation of it
+        self._guard_sets: dict[_FrameKey, list[frozenset[_GuardFact]]] = {}
+        self._undetermined: dict[_FrameKey, set[_GuardFact]] = {}
+        self._guard_filter_fn = self._recording_filter(
+            _compose_with_default(guard_filter_fn)
         )
         self._recompile_limit = recompile_limit
         self._dynamic = dynamic
@@ -1983,6 +2017,10 @@ class PrecompileSession:
         self._compiled: Callable[..., object] | None = None
         self._state = threading.Condition()
         self._active_calls = 0
+        # thread id -> its in-flight calls, so summary() can tell "another
+        # thread is compiling, wait for it" from "the caller is inside the
+        # block's own callable", which it could only wait on forever.
+        self._active_call_threads: dict[int, int] = {}
         self._closing = False
         self._finished = False
 
@@ -2071,6 +2109,10 @@ class PrecompileSession:
                 raise RuntimeError("PrecompileSession is not active")
             compiled = self._compiled
             self._active_calls += 1
+            caller = threading.get_ident()
+            self._active_call_threads[caller] = (
+                self._active_call_threads.get(caller, 0) + 1
+            )
         try:
             with _capture_config(self._training):
                 result = compiled(*args, **kwargs)
@@ -2080,6 +2122,10 @@ class PrecompileSession:
         finally:
             with self._state:
                 self._active_calls -= 1
+                if self._active_call_threads[caller] > 1:
+                    self._active_call_threads[caller] -= 1
+                else:
+                    del self._active_call_threads[caller]
                 if self._active_calls == 0:
                     self._state.notify_all()
         return result
@@ -2178,6 +2224,228 @@ class PrecompileSession:
                     with self._state:
                         self._state.notify_all()
             self._recorded_exception_keys.clear()
+
+    def _recording_filter(
+        self,
+        inner: Callable[
+            [Sequence[GuardFilterEntry]], tuple[Sequence[bool], Sequence[bool]]
+        ],
+    ) -> Callable[[Sequence[GuardFilterEntry]], Sequence[bool]]:
+        """
+        Remember which guard types were discarded. A dropped guard does not
+        fail at serving time, it silently widens what a graph is reused for, so
+        the set has to be inspectable rather than invisible.
+        """
+
+        # Every distinct fact, interned under the lock below so the session
+        # grows with facts rather than with variants.
+        pool: dict[_GuardFact, _GuardFact] = {}
+
+        def filter_fn(entries: Sequence[GuardFilterEntry]) -> Sequence[bool]:
+            # A custom filter composes with the default, so the identity drops
+            # the default makes anyway are judged as they always are; only a
+            # drop the custom filter ADDED is risky by construction, because
+            # nothing here can say what the caller gave up. The composition
+            # hands back the default's own verdicts, so it runs once per compile.
+            decisions, default_kept = inner(entries)
+            global_state_kept = any(
+                keep and e.guard_type == "GLOBAL_STATE"
+                for keep, e in zip(decisions, entries)
+            )
+            facts: set[_GuardFact] = set()
+            undetermined: set[_GuardFact] = set()
+            kept_slots: set[tuple[str, str]] = set()
+            dropped_slots: set[tuple[str, str]] = set()
+            risky_slots: set[tuple[str, str]] = set()
+            # Merged under the one lock acquisition below rather than taken per
+            # entry: this runs on the compiling thread for every guard of every
+            # compilation.
+            dropped_code: dict[tuple[str, str], str] = {}
+            for keep, by_default, entry in zip(decisions, default_kept, entries):
+                # Normalized where the slot is RECORDED, not where it is read: a
+                # Dynamo per-process counter (__builtins_dict___14) otherwise
+                # makes one logical slot appear once per compilation, under names
+                # that change every run, and the slot lists, the risky subset and
+                # the rendered code end up spelling it three different ways.
+                # _mask_keys as well because a source name interpolates the
+                # data key it reads (cfg['/home/me/w.pt']), and this name is
+                # what every slot list and every fact spells the source as.
+                slot = (entry.guard_type, _mask_keys(_normalize(entry.name)))
+                # A no-op type's marker is not what makes its check: GLOBAL_STATE's
+                # leaf is, so the leaf's verdict decides, not the marker's.
+                noop = entry.guard_type in _NOOP_GUARD_TYPES
+                # A precondition nothing checks however the filter voted:
+                # _is_noop_guard_type names the types GuardBuilder emits no check
+                # for beyond those markers -- EMPTY_NN_MODULE_HOOKS_DICT under
+                # skip_nnmodule_hook_guards, the default -- and FSDP_TRAINING_STATE
+                # is state GlobalStateGuard does not snapshot either. Neither
+                # dropped nor risky: no filter decision took them away.
+                unchecked = entry.guard_type == "FSDP_TRAINING_STATE" or (
+                    not noop and _is_noop_guard_type(entry.guard_type)
+                )
+                enforced = not unchecked and (global_state_kept if noop else keep)
+                unmodelled = entry.guard_type in _UNMODELLED_GUARD_TYPES
+                # Rendered once per entry: the fact and the dropped-code line
+                # want the same rendering, and rendering parses the check.
+                code = _render_code(entry.orig_guard.code_list)
+                if enforced:
+                    kept_slots.add(slot)
+                elif unchecked:
+                    # NEITHER list, which is what the two of them mean: the
+                    # filter's verdict is what they report, and no verdict took
+                    # this slot away -- nothing ever checked it. GuardFact.enforced
+                    # below is where the report says so. See PrecompileSummary.
+                    pass
+                else:
+                    dropped_slots.add(slot)
+                    rendered = " ; ".join(code)
+                    if rendered:
+                        # The FIRST rendering, as
+                        # PrecompileSummary.dropped_guard_code documents: one
+                        # rendering however many variants dropped the slot, so a
+                        # check that embeds its value tells the form of the check
+                        # rather than every value the slot took.
+                        dropped_code.setdefault(slot, rendered)
+                    # Risky here means a drop the default filter would not have
+                    # made, or one whose fact differed between variants, which
+                    # summary() decides from the fact sets recorded below.
+                    if by_default:
+                        risky_slots.add(slot)
+                # Never compared, so never claimed to hold: see
+                # _UNMODELLED_GUARD_TYPES.
+                (undetermined if unmodelled else facts).add(
+                    _GuardFact(
+                        guard_type=entry.guard_type,
+                        source=slot[1],
+                        code=code,
+                        value=_value_fingerprint(entry),
+                        enforced=enforced,
+                    )
+                )
+            # One filter call is one compilation, and only the package knows
+            # which frame is being compiled. Without it there is no frame to
+            # attribute the facts to, so they go unrecorded rather than into a
+            # made-up one.
+            compiling = self._package._current_entry
+            key = None
+            if compiling is not None:
+                code = compiling.python_code
+                key = (code.co_name, code.co_filename, code.co_firstlineno)
+            # Published under the lock a reader takes, in one step, because this
+            # runs on whatever thread is compiling.
+            with self._state:
+                self._kept_guards |= kept_slots
+                self._dropped_guards |= dropped_slots
+                self._risky_dropped_guards |= risky_slots
+                for slot, rendered in dropped_code.items():
+                    self._dropped_guard_code.setdefault(slot, rendered)
+                # One object per distinct fact, so a recompiled frame repeating
+                # nearly all of its guards costs facts rather than variants.
+                facts = {pool.setdefault(f, f) for f in facts}
+                undetermined = {pool.setdefault(f, f) for f in undetermined}
+                if key is not None:
+                    # Recorded per FRAME: entry.name is frame-local, so the same
+                    # slot name in two frames is two slots, and one fact set for
+                    # both would read a rebind that never happened.
+                    self._guard_sets.setdefault(key, []).append(frozenset(facts))
+                    self._undetermined.setdefault(key, set()).update(undetermined)
+            return decisions
+
+        return filter_fn
+
+    def _value_varying_slots(
+        self, key: _FrameKey | None = None
+    ) -> set[tuple[str, str]]:
+        """Dropped slots whose recorded fact differed between one frame's variants.
+
+        Narrower than _varying_guard_slots, deliberately: that one reports what
+        tells the variants apart at all, kept guards and present-in-some-variants
+        included, and neither is evidence that a DROP widened the artifact. Only
+        the variants that dropped the slot are compared, and what is compared is
+        a whole variant's set of facts for it, as there, so one variant holding
+        several (a HASATTR per attribute name on one parent source) is not
+        variation. Over every frame when key is None, which is what summary()
+        reports: a slot that varied in the frame that owns it varied. Call under
+        _state.
+        """
+        varying: set[tuple[str, str]] = set()
+        for frame, variants in self._guard_sets.items():
+            if key not in (None, frame):
+                continue
+            seen: dict[tuple[str, str], set[frozenset[_SlotCheck]]] = {}
+            for facts in variants:
+                here: dict[tuple[str, str], set[_SlotCheck]] = {}
+                for fact in facts:
+                    if fact.enforced:
+                        continue
+                    slot = (fact.guard_type, fact.source)
+                    here.setdefault(slot, set()).add((fact.code, fact.value))
+                for slot, rendered in here.items():
+                    seen.setdefault(slot, set()).add(frozenset(rendered))
+            varying |= {
+                slot for slot, per_variant in seen.items() if len(per_variant) > 1
+            }
+        return varying
+
+    def summary(self) -> PrecompileSummary:
+        """The report for the capture so far.
+
+        Callable while the block is open, and it WAITS for the calls in flight:
+        reading the package's cache entry needs no compile holding it, which is
+        what ``CompilePackage.validate`` refuses, so a concurrent capture call
+        would otherwise make this raise ``AssertionError`` on the reader's
+        thread. A call from inside the block's own callable cannot be waited for
+        -- it would be waiting on itself -- so that raises instead of hanging.
+
+        ``truncated`` is left empty here because the recompile-limit bookkeeping
+        that fills it is not part of this build, so ``complete`` cannot see a
+        frame that hit the limit: read it as "complete apart from that".
+        """
+        # Snapshotted under the lock because a compile on another thread records
+        # into the sets below, and a reader wants one consistent view. The
+        # slots are already normalized, so every list here spells one slot the
+        # same way and risky_dropped_guards really is a subset of dropped_guards.
+        with self._state:
+            if self._active_call_threads.get(threading.get_ident()):
+                raise RuntimeError(
+                    "PrecompileSession.summary() cannot be called from inside a "
+                    "capture call: it would wait for that call to finish. Call "
+                    "it from the block, or after it."
+                )
+            while self._active_calls:
+                self._state.wait()
+            dropped = set(self._dropped_guards)
+            kept = set(self._kept_guards)
+            # Two routes, per risky_dropped_guards: a drop the default filter
+            # would not have made, and a drop whose value told the variants
+            # apart. Merely being absent from one variant is neither -- that
+            # flags every ordinary multi-branch capture.
+            # Intersected with dropped because a fact of a slot nothing checks
+            # varies like any other, and risky_dropped_guards is a subset of
+            # dropped_guards.
+            risky = self._risky_dropped_guards | (self._value_varying_slots() & dropped)
+            dropped_code = dict(self._dropped_guard_code)
+            capture_errors = list(self._capture_errors)
+            guard_sets = {
+                frame: list(variants) for frame, variants in self._guard_sets.items()
+            }
+            # Under the lock the drain above left held, so no call can start
+            # between the two and reach a compile while the entry is read.
+            entry = self._package.cache_entry()
+        return _summarize(
+            entry,
+            dropped=dropped,
+            kept=kept,
+            # The invariance policy that would prune a kept guard is not part of
+            # this build, and neither is the recompile-limit bookkeeping behind
+            # truncated.
+            policy_dropped=set(),
+            risky=risky,
+            truncated=frozenset(),
+            capture_errors=capture_errors,
+            guard_sets=guard_sets,
+            dropped_code=dropped_code,
+        )
 
 
 def precompile_capture(
